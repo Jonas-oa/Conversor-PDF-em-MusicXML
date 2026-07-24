@@ -1,0 +1,22 @@
+{
+  "name": "@partitura-viva/omr-service",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Microsserviço AGPL isolado para converter PDF em MusicXML com Audiveris.",
+  "license": "AGPL-3.0-only",
+  "scripts": {
+    "start": "node src/start.mjs",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "@fastify/cors": "11.3.0",
+    "@fastify/multipart": "10.1.0",
+    "fast-xml-parser": "5.10.1",
+    "fastify": "5.10.0",
+    "fflate": "0.8.3"
+  }
+}
