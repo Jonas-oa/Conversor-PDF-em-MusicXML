@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readdir, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -8,7 +8,7 @@ import { loadConfig } from "../src/config.mjs";
 
 const XML = '<?xml version="1.0"?><score-partwise version="4.0"><part-list/><part id="P1"><measure number="1"><note><pitch><step>A</step><octave>4</octave></pitch><duration>1</duration></note></measure></part></score-partwise>';
 
-async function fixture(t, overrides = {}) {
+async function fixture(t, overrides = {}, runnerOverride = null) {
   const dataDir = await mkdtemp(path.join(os.tmpdir(), "partitura-omr-test-"));
   t.after(() => rm(dataDir, { recursive: true, force: true }));
   const config = {
@@ -19,13 +19,14 @@ async function fixture(t, overrides = {}) {
     }),
     ...overrides,
   };
-  const runner = async () => ({
+  const runner = runnerOverride || (async () => ({
     xml: XML,
     engine: "Audiveris test",
     metrics: { parts: 1, measures: 1, notes: 1, pitchedNotes: 1, rests: 0 },
     warnings: [],
-  });
+  }));
   const app = await createApp({ config, runner });
+  app.testDataDir = dataDir;
   await app.ready();
   t.after(() => app.close());
   return app;
@@ -78,6 +79,90 @@ test("aceita PDF, processa em fila e devolve MusicXML", async (t) => {
   assert.doesNotMatch(JSON.stringify(completed), /teste\.pdf/);
 });
 
+test("converte de forma síncrona e remove os arquivos temporários", async (t) => {
+  const app = await fixture(t);
+  const upload = multipartPdf();
+  const response = await app.inject({
+    method: "POST",
+    url: "/v1/convert",
+    headers: {
+      origin: "https://app.example.test",
+      "content-type": `multipart/form-data; boundary=${upload.boundary}`,
+    },
+    payload: upload.body,
+  });
+  assert.equal(response.statusCode, 200);
+  const result = response.json();
+  assert.equal(result.status, "completed");
+  assert.match(result.xml, /score-partwise/);
+  assert.equal(result.metrics.notes, 1);
+  assert.deepEqual(await readdir(app.testDataDir), [], "nenhum PDF permanece após a resposta");
+});
+
+test("protege a conversão com chave sem bloquear saúde e fonte", async (t) => {
+  const app = await fixture(t, { accessKey: "segredo-local" });
+  const withoutKey = multipartPdf("without-key");
+  const denied = await app.inject({
+    method: "POST",
+    url: "/v1/convert",
+    headers: { "content-type": `multipart/form-data; boundary=${withoutKey.boundary}` },
+    payload: withoutKey.body,
+  });
+  assert.equal(denied.statusCode, 401);
+  assert.equal(denied.json().error.code, "UNAUTHORIZED");
+
+  const withKey = multipartPdf("with-key");
+  const accepted = await app.inject({
+    method: "POST",
+    url: "/v1/convert",
+    headers: {
+      "x-omr-key": "segredo-local",
+      "content-type": `multipart/form-data; boundary=${withKey.boundary}`,
+    },
+    payload: withKey.body,
+  });
+  assert.equal(accepted.statusCode, 200);
+  assert.equal((await app.inject({ method: "GET", url: "/health" })).statusCode, 200);
+  assert.equal((await app.inject({ method: "GET", url: "/source" })).statusCode, 302);
+});
+
+test("recusa conversões paralelas acima da concorrência configurada", async (t) => {
+  let release;
+  let started;
+  const running = new Promise((resolve) => { started = resolve; });
+  const runner = async () => {
+    started();
+    await new Promise((resolve) => { release = resolve; });
+    return {
+      xml: XML,
+      engine: "Audiveris test",
+      metrics: { parts: 1, measures: 1, notes: 1, pitchedNotes: 1, rests: 0 },
+      warnings: [],
+    };
+  };
+  const app = await fixture(t, { concurrency: 1 }, runner);
+  const firstUpload = multipartPdf("first");
+  const first = app.inject({
+    method: "POST",
+    url: "/v1/convert",
+    headers: { "content-type": `multipart/form-data; boundary=${firstUpload.boundary}` },
+    payload: firstUpload.body,
+  });
+  await running;
+
+  const secondUpload = multipartPdf("second");
+  const second = await app.inject({
+    method: "POST",
+    url: "/v1/convert",
+    headers: { "content-type": `multipart/form-data; boundary=${secondUpload.boundary}` },
+    payload: secondUpload.body,
+  });
+  assert.equal(second.statusCode, 503);
+  assert.equal(second.json().error.code, "BUSY");
+  release();
+  assert.equal((await first).statusCode, 200);
+});
+
 test("recusa conteúdo que apenas finge ser PDF", async (t) => {
   const app = await fixture(t);
   const upload = multipartPdf();
@@ -97,4 +182,5 @@ test("expõe saúde e endereço do código-fonte", async (t) => {
   const response = await app.inject({ method: "GET", url: "/health" });
   assert.equal(response.statusCode, 200);
   assert.equal(response.json().sourceUrl, "https://example.test/source");
+  assert.equal(response.json().synchronous.endpoint, "/v1/convert");
 });

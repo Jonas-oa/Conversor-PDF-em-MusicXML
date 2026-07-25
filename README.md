@@ -16,6 +16,8 @@ código Audiveris copiado ou vinculado ao PWA.
 
 ## API
 
+- `POST /v1/convert`: conversão síncrona para Cloud Run; devolve MusicXML,
+  métricas e avisos na mesma resposta;
 - `POST /v1/jobs`: multipart com o campo `score` contendo um PDF;
 - `GET /v1/jobs/:id`: estado, métricas e avisos;
 - `GET /v1/jobs/:id/result`: MusicXML após conclusão;
@@ -24,6 +26,11 @@ código Audiveris copiado ou vinculado ao PWA.
 
 Os trabalhos sobrevivem à reinicialização em `OMR_DATA_DIR` e são apagados
 após o TTL configurado.
+
+No Cloud Run, use `POST /v1/convert`. Esse endpoint mantém a requisição aberta,
+usa apenas armazenamento temporário e remove o PDF antes de responder. O fluxo
+assíncrono `/v1/jobs` permanece disponível para servidores com disco
+persistente e CPU continuamente alocada.
 
 ## Desenvolvimento
 
@@ -40,6 +47,8 @@ simulado. A execução real requer `AUDIVERIS_COMMAND`.
 
 - `ALLOWED_ORIGINS`: origens do PWA separadas por vírgula;
 - `SOURCE_URL`: código-fonte exato oferecido aos usuários;
+- `OMR_ACCESS_KEY`: chave opcional exigida em `X-OMR-Key` ou `Authorization:
+  Bearer`; recomendada em toda implantação pública;
 - `OMR_DATA_DIR`: diretório persistente dos trabalhos;
 - `MAX_UPLOAD_BYTES`: padrão 30 MiB;
 - `MAX_QUEUED_JOBS`: padrão 20;
@@ -63,3 +72,6 @@ Esse conjunto processa todas as páginas, exporta `.mxl`, preserva o projeto
 
 O ensaio real com o PDF de quatro páginas de *Für Elise* está registrado em
 [`docs/validation-fur-elise.md`](docs/validation-fur-elise.md).
+
+O passo a passo de implantação serverless está em
+[`docs/cloud-run.md`](docs/cloud-run.md).

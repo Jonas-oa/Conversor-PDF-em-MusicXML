@@ -6,7 +6,7 @@ function positiveInteger(value, fallback) {
 }
 
 export function loadConfig(env = process.env) {
-  const dataDir = path.resolve(env.OMR_DATA_DIR || "./data");
+  const dataDir = path.resolve(env.OMR_DATA_DIR || (env.K_SERVICE ? "/tmp/partitura-omr" : "./data"));
   return Object.freeze({
     host: env.HOST || "0.0.0.0",
     port: positiveInteger(env.PORT, 8081),
@@ -15,6 +15,7 @@ export function loadConfig(env = process.env) {
     audiverisVersion: env.AUDIVERIS_VERSION || "5.11.0",
     ocrLanguageFile: env.OCR_LANGUAGE_FILE || "/usr/share/tesseract-ocr/5/tessdata/eng.traineddata",
     sourceUrl: env.SOURCE_URL || "https://github.com/Jonas-oa/Conversor-PDF-em-MusicXML",
+    accessKey: env.OMR_ACCESS_KEY || "",
     allowedOrigins: (env.ALLOWED_ORIGINS || "")
       .split(",")
       .map((origin) => origin.trim())
