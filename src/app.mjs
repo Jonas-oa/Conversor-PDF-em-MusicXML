@@ -1,4 +1,6 @@
 import crypto from "node:crypto";
+import { mkdir, rm, writeFile } from "node:fs/promises";
+import path from "node:path";
 import cors from "@fastify/cors";
 import multipart from "@fastify/multipart";
 import Fastify from "fastify";
@@ -21,6 +23,50 @@ function safeFileName(value) {
     .slice(0, 160);
 }
 
+function authorized(request, accessKey) {
+  if (!accessKey) return true;
+  const header = request.headers["x-omr-key"];
+  const bearer = request.headers.authorization?.replace(/^Bearer\s+/i, "");
+  const provided = String(header || bearer || "");
+  const expected = Buffer.from(accessKey);
+  const candidate = Buffer.from(provided);
+  return expected.length === candidate.length
+    && expected.length > 0
+    && crypto.timingSafeEqual(expected, candidate);
+}
+
+async function requireAccess(request, reply, accessKey) {
+  if (authorized(request, accessKey)) return;
+  return reply.code(401).send({
+    error: { code: "UNAUTHORIZED", message: "Chave de acesso do conversor ausente ou inválida." },
+  });
+}
+
+async function readPdf(request, reply) {
+  const part = await request.file();
+  if (!part) {
+    reply.code(400).send({ error: { code: "PDF_REQUIRED", message: "Envie um arquivo PDF." } });
+    return null;
+  }
+  if (!/\.pdf$/i.test(part.filename || "") && part.mimetype !== "application/pdf") {
+    part.file.resume();
+    reply.code(415).send({ error: { code: "PDF_ONLY", message: "Somente arquivos PDF são aceitos." } });
+    return null;
+  }
+  const chunks = [];
+  for await (const chunk of part.file) chunks.push(chunk);
+  if (part.file.truncated) {
+    reply.code(413).send({ error: { code: "PDF_TOO_LARGE", message: "O PDF ultrapassa o limite permitido." } });
+    return null;
+  }
+  const bytes = Buffer.concat(chunks);
+  if (bytes.length < 5 || bytes.subarray(0, 5).toString("ascii") !== "%PDF-") {
+    reply.code(415).send({ error: { code: "INVALID_PDF", message: "O arquivo não possui uma estrutura PDF reconhecível." } });
+    return null;
+  }
+  return { bytes, filename: safeFileName(part.filename) };
+}
+
 export async function createApp({
   config,
   runner = createAudiverisRunner(config),
@@ -29,7 +75,7 @@ export async function createApp({
   const app = Fastify({
     logger,
     bodyLimit: config.maxUploadBytes + 1024 * 1024,
-    requestTimeout: 60_000,
+    requestTimeout: config.jobTimeoutMs + 60_000,
   });
   const store = new JobStore(config.dataDir);
   await store.initialize();
@@ -44,6 +90,7 @@ export async function createApp({
       }
     },
     methods: ["GET", "POST", "OPTIONS"],
+    allowedHeaders: ["content-type", "authorization", "x-omr-key"],
   });
   await app.register(multipart, {
     limits: { files: 1, fileSize: config.maxUploadBytes, fields: 4 },
@@ -53,34 +100,72 @@ export async function createApp({
     status: "ok",
     engine: `Audiveris ${config.audiverisVersion}`,
     queue: { pending: queue.pending.length, running: queue.running },
+    synchronous: { endpoint: "/v1/convert", running: synchronousRunning },
+    accessKeyRequired: Boolean(config.accessKey),
     sourceUrl: config.sourceUrl,
   }));
 
   app.get("/source", async (_request, reply) => reply.redirect(config.sourceUrl));
 
-  app.post("/v1/jobs", async (request, reply) => {
+  let synchronousRunning = 0;
+
+  // Endpoint próprio para plataformas serverless. A requisição permanece
+  // aberta enquanto o Audiveris trabalha, garantindo CPU no Cloud Run. Todos
+  // os arquivos vivem apenas em /tmp e são apagados antes da resposta terminar.
+  app.post("/v1/convert", {
+    preHandler: (request, reply) => requireAccess(request, reply, config.accessKey),
+  }, async (request, reply) => {
+    if (synchronousRunning >= config.concurrency) {
+      return reply.code(503).send({
+        error: { code: "BUSY", message: "O conversor está ocupado. Tente novamente em alguns instantes." },
+      });
+    }
+    const upload = await readPdf(request, reply);
+    if (!upload) return reply;
+
+    const id = crypto.randomUUID();
+    const jobDir = path.join(config.dataDir, `sync-${id}`);
+    const outputDir = path.join(jobDir, "output");
+    let statusCode = 200;
+    let responseBody;
+    synchronousRunning += 1;
+    try {
+      await mkdir(outputDir, { recursive: true });
+      const inputPath = path.join(jobDir, "input.pdf");
+      await writeFile(inputPath, upload.bytes);
+      const result = await runner({ id, jobDir, inputPath, outputDir });
+      responseBody = {
+        status: "completed",
+        message: "MusicXML gerado e validado.",
+        engine: result.engine,
+        metrics: result.metrics,
+        warnings: result.warnings,
+        sourceUrl: config.sourceUrl,
+        xml: result.xml,
+      };
+    } catch (error) {
+      request.log.error(error);
+      statusCode = 422;
+      responseBody = {
+        error: { code: "OMR_FAILED", message: error.message },
+      };
+    } finally {
+      synchronousRunning -= 1;
+      await rm(jobDir, { recursive: true, force: true });
+    }
+    return reply.code(statusCode).send(responseBody);
+  });
+
+  app.post("/v1/jobs", {
+    preHandler: (request, reply) => requireAccess(request, reply, config.accessKey),
+  }, async (request, reply) => {
     if (queue.size >= config.maxQueuedJobs) {
       return reply.code(503).send({
         error: { code: "QUEUE_FULL", message: "O servidor está ocupado. Tente novamente em alguns minutos." },
       });
     }
-    const part = await request.file();
-    if (!part) {
-      return reply.code(400).send({ error: { code: "PDF_REQUIRED", message: "Envie um arquivo PDF." } });
-    }
-    if (!/\.pdf$/i.test(part.filename || "") && part.mimetype !== "application/pdf") {
-      part.file.resume();
-      return reply.code(415).send({ error: { code: "PDF_ONLY", message: "Somente arquivos PDF são aceitos." } });
-    }
-    const chunks = [];
-    for await (const chunk of part.file) chunks.push(chunk);
-    if (part.file.truncated) {
-      return reply.code(413).send({ error: { code: "PDF_TOO_LARGE", message: "O PDF ultrapassa o limite permitido." } });
-    }
-    const bytes = Buffer.concat(chunks);
-    if (bytes.length < 5 || bytes.subarray(0, 5).toString("ascii") !== "%PDF-") {
-      return reply.code(415).send({ error: { code: "INVALID_PDF", message: "O arquivo não possui uma estrutura PDF reconhecível." } });
-    }
+    const upload = await readPdf(request, reply);
+    if (!upload) return reply;
 
     const id = crypto.randomUUID();
     const now = new Date().toISOString();
@@ -90,26 +175,30 @@ export async function createApp({
       message: "PDF recebido. Aguardando o motor de reconhecimento…",
       createdAt: now,
       updatedAt: now,
-      originalName: safeFileName(part.filename),
-      size: bytes.length,
+      originalName: upload.filename,
+      size: upload.bytes.length,
       engine: `Audiveris ${config.audiverisVersion}`,
       metrics: null,
       warnings: [],
       sourceUrl: config.sourceUrl,
       error: null,
     };
-    await store.create(job, bytes);
+    await store.create(job, upload.bytes);
     queue.enqueue(id);
     return reply.code(202).send(publicJob(job));
   });
 
-  app.get("/v1/jobs/:id", async (request, reply) => {
+  app.get("/v1/jobs/:id", {
+    preHandler: (request, reply) => requireAccess(request, reply, config.accessKey),
+  }, async (request, reply) => {
     const job = await store.get(request.params.id);
     if (!job) return reply.code(404).send({ error: { code: "NOT_FOUND", message: "Conversão não encontrada." } });
     return publicJob(job);
   });
 
-  app.get("/v1/jobs/:id/result", async (request, reply) => {
+  app.get("/v1/jobs/:id/result", {
+    preHandler: (request, reply) => requireAccess(request, reply, config.accessKey),
+  }, async (request, reply) => {
     const job = await store.get(request.params.id);
     if (!job) return reply.code(404).send({ error: { code: "NOT_FOUND", message: "Conversão não encontrada." } });
     if (job.status !== "completed") {

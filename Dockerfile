@@ -20,12 +20,11 @@ COPY LICENSE README.md ./
 RUN mkdir -p /data && chown -R node:node /app /data
 
 ENV NODE_ENV=production \
-    PORT=8081 \
-    OMR_DATA_DIR=/data \
+    PORT=8080 \
+    OMR_DATA_DIR=/tmp/partitura-omr \
     AUDIVERIS_COMMAND=/opt/audiveris/bin/Audiveris \
     AUDIVERIS_VERSION=${AUDIVERIS_VERSION}
 
-VOLUME ["/data"]
-EXPOSE 8081
+EXPOSE 8080
 USER node
 CMD ["node", "src/start.mjs"]

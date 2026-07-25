@@ -1,4 +1,7 @@
+.git
+.github
 node_modules
+npm-debug.log
 data
 test
-*.log
+docs
